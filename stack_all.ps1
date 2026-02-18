@@ -1,49 +1,68 @@
-# 홈(현재) 폴더 구조 예:
-# Home/
-#   ├─ Session/
-#   │    ├─ <AnySession>/{Light,Dark,Flat,Bias}  또는 {Light,masters(dark_stacked.fit,pp_flat_stacked.fit)}
-#   │    └─ ...
-#   └─ Bias/   (선택: 공통 Bias 사용시)
+# 20260216 DarkFlat추가
+# 20260218 세션별 pp_light (보정된 light)를 한번에 스택하도록 변경
 
-# run_all.ps1 ? 세션별 스택 + 프레임수 가중치 최종 합성
-# (Siril 1.4 beta2 호환 / masters 폴더 자동 생성 및 dark_stacked.fit, pp_flat_stacked.fit 저장)
+<# 
+Home/
+  ├─ Session/
+  │    ├─ <AnySession>/{Light,Dark,DarkFlat,Flat,Bias}  또는 {Light,masters(...)}
+  │    └─ ...
+  ├─ Bias/   (선택: 공통 Bias)
+  └─ Dark/   (선택: 공통 Dark)
+공통 DarkFlat은 없음(세션 Flat 기반)
+
+run_all.ps1 : 세션별 보정+등록 -> _ALL_REGISTERED에 모아 최종 스택
+Siril 1.4.x (requires 1.2)
+#>
+
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-# === 사용자 설정 ===
-$SirilCli = "C:\Program Files\Siril\bin\siril-cli.exe"   # siril-cli.exe 경로
-$KeepSsf  = $false                                       # true면 SSF 보존, false면 마지막에 삭제
+# =========================
+# 사용자 설정
+# =========================
+$SirilCli = "C:\Program Files\Siril\bin\siril-cli.exe"
+$KeepSsf  = $false
 
-# === 기본 경로 ===
+# =========================
+# 상수(타입 키)
+# =========================
+$T_BIAS     = "Bias"
+$T_DARK     = "Dark"
+$T_DARKFLAT = "DarkFlat"
+$T_FLAT     = "Flat"
+$T_LIGHT    = "Light"
+
+# =========================
+# 기본 경로
+# =========================
 $HomeDir       = (Get-Location).Path
-$StackPath = Join-Path $HomeDir "stack_all.fit"
 $SessionRoot   = Join-Path $HomeDir "Session"
 $CommonBiasDir = Join-Path $HomeDir "Bias"
-$SessionStacks = Join-Path $HomeDir "_SESSION_STACKS"
-New-Item -ItemType Directory -Force -Path $SessionStacks | Out-Null
+$CommonDarkDir = Join-Path $HomeDir "Dark"
+$AllRegistered = Join-Path $HomeDir "_ALL_REGISTERED"
+$StackPath     = Join-Path $HomeDir "stack_all.fit"
 
-# === 유틸 ===
-function ToSirilPath([string]$p) { ($p -replace '\\','/') }
+New-Item -ItemType Directory -Force -Path $AllRegistered | Out-Null
+
+# =========================
+# 유틸
+# =========================
+function ToSirilPath([string]$p) { (($p -replace '\\','/').Trim()) }
+function ToSirilQ([string]$p) {
+  if ([string]::IsNullOrWhiteSpace($p)) { return '""' }
+  $s = (ToSirilPath $p).Trim().Trim('"')
+  return '"' + $s + '"'
+}
+
 function Write-NoBom([string]$Path, [string]$Content) {
   $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
   [System.IO.File]::WriteAllText($Path, $Content, $utf8NoBom)
   Write-Host "  SSF saved: $Path"
 }
-function CountFrames([string]$Dir) {
-  if (-not (Test-Path $Dir)) { return 0 }
-  (Get-ChildItem $Dir -Recurse -File -Include *.fit,*.fits,*.xisf,*.tif,*.tiff -ErrorAction SilentlyContinue | Measure-Object).Count
-}
-function FlattenTo([string]$SrcDir, [string]$DstDir) {
-  if (-not (Test-Path $SrcDir)) { return $false }
-  New-Item -ItemType Directory -Force -Path $DstDir | Out-Null
-  $files = Get-ChildItem $SrcDir -Recurse -File -Include *.fit,*.fits,*.xisf,*.tif,*.tiff -ErrorAction SilentlyContinue
-  if ($files.Count -eq 0) { return $false }
-  foreach ($f in $files) { Copy-Item $f.FullName -Dest (Join-Path $DstDir $f.Name) -Force }
-  return $true
-}
+
 function Invoke-Siril([string]$SirilCli, [string]$SsfPath, [string]$LogPath) {
   $old = $ErrorActionPreference
-  $ErrorActionPreference = 'Continue'   # Siril stderr로 인한 중단 방지
+  $ErrorActionPreference = 'Continue'  # Siril stderr로 중단 방지
   try {
     $out = & "$SirilCli" -s "$SsfPath" 2>&1
     if ($LogPath) { $out | Out-File -FilePath $LogPath -Encoding utf8 }
@@ -53,211 +72,512 @@ function Invoke-Siril([string]$SirilCli, [string]$SsfPath, [string]$LogPath) {
   }
 }
 
-if (-not (Test-Path $SessionRoot)) { throw "Session 폴더가 없습니다: $SessionRoot" }
+function Find-Master([string]$Dir, [string[]]$names) {
+  $names | ForEach-Object { Join-Path $Dir $_ } |
+    Where-Object { Test-Path $_ } |
+    Select-Object -First 1
+}
 
-# === 공통 Bias 처리 ===
-$CommonBiasFile = $null
-$CreatedSsf = [System.Collections.Generic.List[string]]::new()
+function CountFrames([string]$Dir) {
+  if (-not (Test-Path $Dir)) { return 0 }
+  (Get-ChildItem $Dir -Recurse -File -Include *.fit,*.fits,*.fts,*.xisf,*.tif,*.tiff -ErrorAction SilentlyContinue |
+    Measure-Object).Count
+}
 
-if (Test-Path $CommonBiasDir) {
-  $cand = @("masterbias.fit","bias_stacked.fit") | ForEach-Object { Join-Path $CommonBiasDir $_ }
-  $CommonBiasFile = $cand | Where-Object { Test-Path $_ } | Select-Object -First 1
-  if ($CommonBiasFile) {
-    Write-Host "▶ 공통 Bias: $(Split-Path $CommonBiasFile -Leaf) 사용"
-  } elseif ((CountFrames $CommonBiasDir) -gt 0) {
-    Write-Host "▶ 공통 Bias 생성"
-    $ssf = @"
-requires 1.2
-cd $(ToSirilPath $CommonBiasDir)
-convert .
-stack . med -out=masterbias
+# "필요할 때만 복사"를 위해: 복사하면서 개수 리턴
+function FlattenToCount([string]$SrcDir, [string]$DstDir) {
+  if (-not (Test-Path $SrcDir)) { return 0 }
+  $files = Get-ChildItem $SrcDir -Recurse -File -Include *.fit,*.fits,*.fts,*.xisf,*.tif,*.tiff -ErrorAction SilentlyContinue
+  if (-not $files -or $files.Count -eq 0) { return 0 }
 
-"@
-    $ssfPath = Join-Path $HomeDir "___make_common_bias.ssf"
-    Write-NoBom $ssfPath $ssf
-    $CreatedSsf.Add($ssfPath)
-    & "$SirilCli" -s "$ssfPath"
-    $CommonBiasFile = Join-Path $CommonBiasDir "masterbias.fit"
+  New-Item -ItemType Directory -Force -Path $DstDir | Out-Null
+
+  foreach ($f in $files) {
+    Copy-Item $f.FullName -Destination (Join-Path $DstDir $f.Name) -Force
+  }
+  return $files.Count
+}
+
+# Siril 옵션 인자용 상대경로(대상 파일 존재여부 무관)
+function RelPath([string]$FromDir, [string]$ToPath) {
+  if (-not (Test-Path -LiteralPath $FromDir)) {
+    New-Item -ItemType Directory -Force -Path $FromDir | Out-Null
+  }
+  $fromFull = [System.IO.Path]::GetFullPath($FromDir)
+
+  $toFull = if (Test-Path -LiteralPath $ToPath) {
+    (Resolve-Path -LiteralPath $ToPath).Path
+  } else {
+    [System.IO.Path]::GetFullPath($ToPath)
+  }
+
+  $fromUri = [Uri]($fromFull.TrimEnd('\') + '\')
+  $toUri   = [Uri]$toFull
+  $rel = $fromUri.MakeRelativeUri($toUri).ToString().Replace('/', '\')
+  return $rel
+}
+
+# =========================
+# Plan/State
+# =========================
+function New-CalState([string]$TypeKey) {
+  [pscustomobject]@{
+    Type    = $TypeKey
+    SrcDir  = $null
+    WorkDir = $null
+
+    Copied  = 0        # _WORK로 복사된 프레임 수
+    Master  = $null    # 사용할 master 파일 경로(세션 masters 또는 공통)
+    Create  = $false   # master 생성 필요 여부
+
+    Status  = "없음"   # 재사용/공통/생성/없음
   }
 }
 
-# === 세션 루프 ===
+function New-Plan([string]$SPath, [string]$SName, [string]$HomeDir, [string]$CommonBias, [string]$CommonDark) {
+  $masters = Join-Path $SPath "masters"
+  $work    = Join-Path $SPath "_WORK"
+
+  [pscustomobject]@{
+    HomeDir     = $HomeDir
+    SPath       = $SPath
+    SName       = $SName
+
+    MastersDir  = $masters
+    WorkRoot    = $work
+
+    CommonBias  = $CommonBias   # full path or $null
+    CommonDark  = $CommonDark   # full path or $null
+
+    Cal         = @{}           # TypeKey -> CalState
+  }
+}
+
+# "masters 재사용 / 공통 사용 / 세션프레임 있으면 생성" 공통 로직
+function Resolve-FromSessionOrCommon {
+  param(
+    [pscustomobject]$Plan,
+    [pscustomobject]$State,
+    [string[]]$ReuseNames,
+    [string]$CommonMasterPath,   # Bias/Dark만 사용(없으면 $null)
+    [string]$CreateMasterName    # 생성 시 masters에 저장할 파일명
+  )
+
+  # 1) masters 재사용
+  $reuse = Find-Master $Plan.MastersDir $ReuseNames
+  if ($reuse) {
+    $State.Master = $reuse
+    $State.Status = "세션"
+    return
+  }
+
+  # 2) 공통 master
+  if ($CommonMasterPath) {
+    $State.Master = $CommonMasterPath
+    $State.Status = "공통"
+    return
+  }
+
+  # 3) 세션 프레임 있으면 생성 예정
+  if ($State.Copied -gt 0) {
+    $State.Master = Join-Path $Plan.MastersDir $CreateMasterName
+    $State.Create = $true
+    $State.Status = "생성"
+    return
+  }
+
+  $State.Master = $null
+  $State.Status = "없음"
+}
+
+# =========================
+# 공통 마스터 생성( Bias / Dark )
+# =========================
+function Ensure-CommonMaster {
+  param(
+    [ValidateSet("bias","dark")] [string]$Kind,
+    [string]$CommonDir,
+    [string]$HomeDir,
+    [string]$SirilCli,
+    [string]$CommonBiasForDark  # dark일 때만 사용(없으면 $null)
+  )
+
+  if (-not (Test-Path $CommonDir)) { return $null }
+
+  $reuseNames = if ($Kind -eq "bias") { @("masterbias.fit","bias_stacked.fit") } else { @("masterdark.fit","dark_stacked.fit") }
+  $cand = $reuseNames | ForEach-Object { Join-Path $CommonDir $_ }
+  $reuse = $cand | Where-Object { Test-Path $_ } | Select-Object -First 1
+  if ($reuse) { return (Resolve-Path $reuse).Path }
+
+  if ((CountFrames $CommonDir) -le 0) { return $null }
+
+  Write-Host "▶ 공통 $Kind 생성"
+
+  $outName = if ($Kind -eq "bias") { "masterbias" } else { "masterdark" }
+  $stackLine = if ($Kind -eq "bias") { "stack bias_ med -out=$outName" } else { "stack pp_dark_ med -nonorm -out=$outName" }
+
+  # dark는 bias가 있으면 제거 후 stack
+  $calLine = ""
+  if ($Kind -eq "dark") {
+    if ($CommonBiasForDark) {
+      $calLine = "calibrate dark_ -bias=$(RelPath $CommonDir $CommonBiasForDark) -prefix=pp_"
+    } else {
+      # bias 없으면 그냥 pp_ 없이 stack해도 되지만, 뒤 일관성을 위해 pp_를 안 만들거면 stack 대상도 바꿔야 함
+      # -> bias 없으면 그냥 dark_를 stack
+      $stackLine = "stack dark_ med -nonorm -out=$outName"
+    }
+  }
+
+  $ssf = @"
+requires 1.2
+cd $(ToSirilQ $CommonDir)
+convert $Kind
+$calLine
+$stackLine
+
+"@
+
+  $ssfPath = Join-Path $HomeDir "___make_common_$Kind.ssf"
+  Write-NoBom $ssfPath $ssf
+  $null = Invoke-Siril $SirilCli $ssfPath $null
+
+  $masterFit = Join-Path $CommonDir ($outName + ".fit")
+  if (Test-Path $masterFit) { return (Resolve-Path $masterFit).Path }
+
+  Write-Warning "공통 $Kind 생성 후 $($outName).fit을 찾지 못했습니다. ($CommonDir)"
+  return $null
+}
+
+# =========================
+# 타입별 Resolve
+# =========================
+function Resolve-Bias {
+  param([pscustomobject]$Plan)
+
+  $s = New-CalState $T_BIAS
+  $s.SrcDir  = Join-Path $Plan.SPath "Bias"
+  $s.WorkDir = Join-Path $Plan.WorkRoot "BIAS"
+
+  # masters 재사용이면 복사 불필요, 없으면 복사
+  $reuse = Find-Master $Plan.MastersDir @("bias_stacked.fit","masterbias.fit")
+  if (-not $reuse) { $s.Copied = FlattenToCount $s.SrcDir $s.WorkDir }
+
+  # Bias는 공통 Bias 허용
+  Resolve-FromSessionOrCommon -Plan $Plan -State $s `
+    -ReuseNames @("bias_stacked.fit","masterbias.fit") `
+    -CommonMasterPath $Plan.CommonBias `
+    -CreateMasterName "bias_stacked.fit"
+
+  $Plan.Cal[$T_BIAS] = $s
+}
+
+function Resolve-Dark {
+  param([pscustomobject]$Plan)
+
+  $s = New-CalState $T_DARK
+  $s.SrcDir  = Join-Path $Plan.SPath "Dark"
+  $s.WorkDir = Join-Path $Plan.WorkRoot "DARK"
+
+  $reuse = Find-Master $Plan.MastersDir @("dark_stacked.fit","masterdark.fit")
+  if (-not $reuse) { $s.Copied = FlattenToCount $s.SrcDir $s.WorkDir }
+
+  # Dark는 공통 Dark 허용
+  Resolve-FromSessionOrCommon -Plan $Plan -State $s `
+    -ReuseNames @("dark_stacked.fit","masterdark.fit") `
+    -CommonMasterPath $Plan.CommonDark `
+    -CreateMasterName "dark_stacked.fit"
+
+  $Plan.Cal[$T_DARK] = $s
+}
+
+function Resolve-DarkFlat {
+  param([pscustomobject]$Plan)
+
+  $s = New-CalState $T_DARKFLAT
+  $s.SrcDir  = Join-Path $Plan.SPath "DarkFlat"
+  $s.WorkDir = Join-Path $Plan.WorkRoot "DARKFLAT"
+
+  # DarkFlat은 공통 없음
+  $reuse = Find-Master $Plan.MastersDir @("darkflat_stacked.fit","masterdarkflat.fit")
+  if (-not $reuse) { $s.Copied = FlattenToCount $s.SrcDir $s.WorkDir }
+
+  Resolve-FromSessionOrCommon -Plan $Plan -State $s `
+    -ReuseNames @("darkflat_stacked.fit","masterdarkflat.fit") `
+    -CommonMasterPath $null `
+    -CreateMasterName "darkflat_stacked.fit"
+
+  $Plan.Cal[$T_DARKFLAT] = $s
+}
+
+function Resolve-Flat {
+  param([pscustomobject]$Plan)
+
+  $s = New-CalState $T_FLAT
+  $s.SrcDir  = Join-Path $Plan.SPath "Flat"
+  $s.WorkDir = Join-Path $Plan.WorkRoot "FLAT"
+
+  $reuse = Find-Master $Plan.MastersDir @("pp_flat_stacked.fit","masterflat.fit")
+  if (-not $reuse) { $s.Copied = FlattenToCount $s.SrcDir $s.WorkDir }
+
+  # Flat은 공통 master 개념 없음(세션별 생성/재사용만)
+  Resolve-FromSessionOrCommon -Plan $Plan -State $s `
+    -ReuseNames @("pp_flat_stacked.fit","masterflat.fit") `
+    -CommonMasterPath $null `
+    -CreateMasterName "pp_flat_stacked.fit"
+
+  $Plan.Cal[$T_FLAT] = $s
+}
+
+function Resolve-Light {
+  param([pscustomobject]$Plan)
+
+  $s = New-CalState $T_LIGHT
+  $s.SrcDir  = Join-Path $Plan.SPath "Light"
+  $s.WorkDir = Join-Path $Plan.WorkRoot "LIGHT"
+
+  # Light는 항상 프레임 필요(masters 재사용 개념 없음)
+  $s.Copied = FlattenToCount $s.SrcDir $s.WorkDir
+  if ($s.Copied -gt 0) { $s.Status = "복사" } else { $s.Status = "없음" }
+
+  $Plan.Cal[$T_LIGHT] = $s
+}
+
+# =========================
+# SSF 빌드
+# =========================
+function Build-SessionSsf {
+  param([pscustomobject]$Plan)
+
+  $B  = $Plan.Cal[$T_BIAS]
+  $D  = $Plan.Cal[$T_DARK]
+  $DF = $Plan.Cal[$T_DARKFLAT]
+  $F  = $Plan.Cal[$T_FLAT]
+  $L  = $Plan.Cal[$T_LIGHT]
+
+  $ssf = @"
+requires 1.2
+
+"@
+
+  # --- Bias master 생성 (필요시) ---
+  if ($B.Create) {
+    $ssf += @"
+cd $(ToSirilQ $B.WorkDir)
+convert bias
+stack bias_ med -out=$(RelPath $B.WorkDir $B.Master)
+
+"@
+  }
+
+  # --- Dark master 생성 (필요시) : bias가 있으면 제거 후 stack ---
+  if ($D.Create) {
+    $darkBiasArg = ""
+    if ($B.Master) { $darkBiasArg = " -bias=" + (RelPath $D.WorkDir $B.Master) }
+
+    $ssf += @"
+cd $(ToSirilQ $D.WorkDir)
+convert dark
+
+"@
+
+    if ($darkBiasArg) {
+      $ssf += @"
+calibrate dark_$darkBiasArg -prefix=pp_
+stack pp_dark_ med -nonorm -out=$(RelPath $D.WorkDir $D.Master)
+
+"@
+    } else {
+      $ssf += @"
+stack dark_ med -nonorm -out=$(RelPath $D.WorkDir $D.Master)
+
+"@
+    }
+  }
+
+  # --- DarkFlat master 생성 (필요시) : bias가 있으면 제거 후 stack ---
+  if ($DF.Create) {
+    $dfBiasArg = ""
+    if ($B.Master) { $dfBiasArg = " -bias=" + (RelPath $DF.WorkDir $B.Master) }
+
+    $ssf += @"
+cd $(ToSirilQ $DF.WorkDir)
+convert darkflat
+
+"@
+
+    if ($dfBiasArg) {
+      $ssf += @"
+calibrate darkflat_$dfBiasArg -prefix=pp_
+stack pp_darkflat_ med -nonorm -out=$(RelPath $DF.WorkDir $DF.Master)
+
+"@
+    } else {
+      $ssf += @"
+stack darkflat_ med -nonorm -out=$(RelPath $DF.WorkDir $DF.Master)
+
+"@
+    }
+  }
+
+  # --- Flat master 생성 (필요시) ---
+  if ($F.Create) {
+    # Flat 보정 우선순위: 세션 DarkFlat > 세션 Dark > 공통 Dark
+    $FlatDarkArg = ""
+    if ($DF.Master) { $FlatDarkArg = " -dark=" + (RelPath $F.WorkDir $DF.Master) }
+    elseif ($D.Master) { $FlatDarkArg = " -dark=" + (RelPath $F.WorkDir $D.Master) }
+
+    $FlatBiasArg = ""
+    if ($B.Master) { $FlatBiasArg = " -bias=" + (RelPath $F.WorkDir $B.Master) }
+
+    $ssf += @"
+cd $(ToSirilQ $F.WorkDir)
+convert flat
+calibrate flat_$FlatDarkArg$FlatBiasArg -cfa -prefix=cbflat_
+stack cbflat_flat_ med -norm=mul -out=$(RelPath $F.WorkDir $F.Master)
+
+"@
+  }
+
+  # --- Light calibrate + register ---
+  # Light 보정 우선순위: 세션 Dark > 공통 Dark > 없음
+  $calDark = ""
+  if ($D.Master) { $calDark = " -dark=" + (RelPath $L.WorkDir $D.Master) }
+
+  $calFlat = ""
+  if ($F.Master) { $calFlat = " -flat=" + (RelPath $L.WorkDir $F.Master) }
+
+  $ssf += @"
+cd $(ToSirilQ $L.WorkDir)
+convert light
+calibrate light_$calDark$calFlat -cc=dark -cfa -equalize_cfa -debayer -prefix=pp_
+
+# 별 적은 필드(B33) 등록 완화
+#setfindstar -relax=on
+
+register pp_light_
+
+"@
+
+  return $ssf
+}
+
+# =========================
+# 세션 _WORK 정리(세션 실행 전)
+# =========================
+function Reset-Work([pscustomobject]$Plan) {
+  if (Test-Path $Plan.WorkRoot) {
+    Remove-Item $Plan.WorkRoot -Recurse -Force -ErrorAction SilentlyContinue
+  }
+  New-Item -ItemType Directory -Force -Path $Plan.WorkRoot | Out-Null
+}
+
+# =========================
+# 메인
+# =========================
+
+# _ALL_REGISTERED 비우기
+Get-ChildItem -Path $AllRegistered -File -ErrorAction SilentlyContinue |
+  Remove-Item -Force -ErrorAction SilentlyContinue
+
+if (-not (Test-Path $SessionRoot)) { throw "Session 폴더가 없습니다: $SessionRoot" }
+
+# 1) 공통 Bias -> 공통 Dark(공통 Bias 반영)
+$CreatedSsf = [System.Collections.Generic.List[string]]::new()
+
+$CommonBiasFile = Ensure-CommonMaster -Kind "bias" -CommonDir $CommonBiasDir -HomeDir $HomeDir -SirilCli $SirilCli -CommonBiasForDark $null
+if ($CommonBiasFile) { Write-Host "▶ 공통 Bias: $(Split-Path $CommonBiasFile -Leaf) 사용" }
+
+$CommonDarkFile = Ensure-CommonMaster -Kind "dark" -CommonDir $CommonDarkDir -HomeDir $HomeDir -SirilCli $SirilCli -CommonBiasForDark $CommonBiasFile
+if ($CommonDarkFile) { Write-Host "▶ 공통 Dark: $(Split-Path $CommonDarkFile -Leaf) 사용" }
+
+# 2) 세션 루프
 $report = New-Object System.Collections.Generic.List[string]
-$sessionDirs = Get-ChildItem $SessionRoot -Directory | Sort-Object Name
+$sessionDirs = @(Get-ChildItem $SessionRoot -Directory | Sort-Object Name)
 if ($sessionDirs.Count -eq 0) { throw "Session 하위에 세션 폴더가 없습니다." }
 
 foreach ($sess in $sessionDirs) {
-  $SPath = $sess.FullName; $SName = $sess.Name
-  $LightDir   = Join-Path $SPath "Light"
-  $DarkDir    = Join-Path $SPath "Dark"
-  $FlatDir    = Join-Path $SPath "Flat"
-  $BiasDir    = Join-Path $SPath "Bias"
-  $MastersDir = Join-Path $SPath "masters"
+  $SPath = $sess.FullName
+  $SName = $sess.Name
 
-  # masters 디렉토리 보장 (항상 존재)
-  New-Item -ItemType Directory -Force -Path $MastersDir | Out-Null
+  $Plan = New-Plan -SPath $SPath -SName $SName -HomeDir $HomeDir -CommonBias $CommonBiasFile -CommonDark $CommonDarkFile
+  New-Item -ItemType Directory -Force -Path $Plan.MastersDir | Out-Null
 
-  # _WORK 평탄화
-  $WorkDir = Join-Path $SPath "_WORK"
-  $W_LIGHT = Join-Path $WorkDir "LIGHT"
-  $W_DARK  = Join-Path $WorkDir "DARK"
-  $W_FLAT  = Join-Path $WorkDir "FLAT"
-  $W_BIAS  = Join-Path $WorkDir "BIAS"
-  New-Item -ItemType Directory -Force -Path $WorkDir | Out-Null
+  # (중요) 세션 실행 전 _WORK 초기화
+  Reset-Work $Plan
 
-  $hasLight = FlattenTo $LightDir $W_LIGHT
-  if (-not $hasLight) { Write-Warning "세션 '$SName' → Light 없음, 건너뜀"; continue }
-  $hasDark  = FlattenTo $DarkDir  $W_DARK
-  $hasFlat  = FlattenTo $FlatDir  $W_FLAT
-  $hasBias  = FlattenTo $BiasDir  $W_BIAS
+  # 타입별 Resolve (복사/재사용/공통/생성 계획 확정)
+  Resolve-Bias     $Plan
+  Resolve-Dark     $Plan
+  Resolve-DarkFlat $Plan
+  Resolve-Flat     $Plan
+  Resolve-Light    $Plan
 
-# masters 폴더 보장
-if (-not (Test-Path $MastersDir)) {
-  New-Item -ItemType Directory -Force -Path $MastersDir | Out-Null
-}
-
-  # masters 재사용 탐색
-  $MasterDark = $null; $MasterFlat = $null
-  $candBias = @("bias_stacked.fit","masterbias.fit") | ForEach-Object { Join-Path $MastersDir $_ }
-  $candDark = @("dark_stacked.fit","masterdark.fit") | ForEach-Object { Join-Path $MastersDir $_ }
-  $candFlat = @("pp_flat_stacked.fit","masterflat.fit") | ForEach-Object { Join-Path $MastersDir $_ }
-  $MasterBias = $candBias | Where-Object { Test-Path $_ } | Select-Object -First 1
-  $MasterDark = $candDark | Where-Object { Test-Path $_ } | Select-Object -First 1
-  $MasterFlat = $candFlat | Where-Object { Test-Path $_ } | Select-Object -First 1
-
-	# Flat용 Bias 결정 (드롭인 교체)
-	$BiasArgForFlat = ""
-	$BiasBlock      = ""
-	$BiasStatus     = "없음"   # 재사용 | 생성 | 공통 | 없음
-
-	if ($MasterBias) {
-	  # masters에 masterbias/bias_stacked가 이미 있음 → 재사용
-	  $BiasArgForFlat = " -bias=$(ToSirilPath $MasterBias)"
-	  $BiasStatus     = "재사용"
-
-	} elseif ($hasBias -and (CountFrames $W_BIAS) -gt 0) {
-	  # 세션 BIAS 프레임으로 마스터 생성
-	  $BiasBlock = @"
-cd $(ToSirilPath $W_BIAS)
-convert .
-stack . med -out=$(ToSirilPath (Join-Path $MastersDir 'bias_stacked'))
-
-"@
-	  $MasterBias     = Join-Path $MastersDir 'bias_stacked.fit'
-	  $BiasArgForFlat = " -bias=$(ToSirilPath $MasterBias)"
-	  $BiasStatus     = "생성"
-
-	} elseif ($CommonBiasFile) {
-	  # 공통 Bias 사용
-	  $BiasArgForFlat = " -bias=$(ToSirilPath $CommonBiasFile)"
-	  $BiasStatus     = "공통"
-
-	} else {
-	  # 정말로 Bias가 없음 → Flat 보정 시 Bias 미사용
-	  $BiasStatus = "없음"
-	}
-
-$DarkStatus = if ($MasterDark) { '재사용' } elseif ($hasDark) { '생성' } else { '없음' }
-$FlatStatus = if ($MasterFlat) { '재사용' } elseif ($hasFlat) { '생성' } else { '없음' }
-# $BiasStatus 는 이미 위에서 계산됨
-
-Write-Host "▶ 세션: $SName  (Dark:$DarkStatus, Flat:$FlatStatus, Bias:$BiasStatus)"
-
-$ssf = @"
-requires 1.2
-$BiasBlock
-
-"@
-
-# 1) Dark master
-if (-not $MasterDark) {
-  if ($hasDark -and (CountFrames $W_DARK) -gt 0) {
-    $ssf += @"
-cd $(ToSirilPath $W_DARK)
-convert .
-stack ._ med -nonorm -out=$(ToSirilPath (Join-Path $MastersDir "dark_stacked"))
-
-"@  # ← 빈 줄 유지 (개행 보장)
-    $MasterDark = Join-Path $MastersDir "dark_stacked.fit"
-  } else {
-    Write-Warning "세션 '$SName' → Dark 없음: 라이트 보정 시 Dark 미사용"
+  $L = $Plan.Cal[$T_LIGHT]
+  if ($L.Copied -le 0) {
+    Write-Warning "세션 '$SName' → Light 없음, 건너뜀"
+    continue
   }
-}
 
-# 2) Flat master
-if (-not $MasterFlat) {
-  if ($hasFlat -and (CountFrames $W_FLAT) -gt 0) {
-    $ssf += @"
-cd $(ToSirilPath $W_FLAT)
-convert .
-calibrate ._$BiasArgForFlat -cfa -prefix=cb_flat_
-stack cb_flat_._ med -norm=mul -out=$(ToSirilPath (Join-Path $MastersDir "pp_flat_stacked"))
+  $B  = $Plan.Cal[$T_BIAS]
+  $D  = $Plan.Cal[$T_DARK]
+  $DF = $Plan.Cal[$T_DARKFLAT]
+  $F  = $Plan.Cal[$T_FLAT]
 
-"@  # ← 빈 줄 유지
-    $MasterFlat = Join-Path $MastersDir "pp_flat_stacked.fit"
-  } else {
-    Write-Warning "세션 '$SName' → Flat 없음: 라이트 보정 시 Flat 미사용"
-  }
-}
+  Write-Host ("▶ 세션: {0}  (DarkFlat:{1}, Dark:{2}, Flat:{3}, Bias:{4})" -f `
+    $SName, $DF.Status, $D.Status, $F.Status, $B.Status)
 
-# 3) Light 처리
-$calDark = ""; if ($MasterDark) { $calDark = " -dark=$(ToSirilPath $MasterDark)" }
-$calFlat = ""; if ($MasterFlat) { $calFlat = " -flat=$(ToSirilPath $MasterFlat)" }
-
-$ssf += @"
-cd $(ToSirilPath $W_LIGHT)
-convert .
-calibrate ._$calDark$calFlat -cc=dark -cfa -equalize_cfa -debayer -prefix=pp_
-register pp_._
-stack r_pp_._ rej 3 3 -norm=addscale -output_norm -rgb_equal -32b -out=stack_session
-
-"@  # ← 빈 줄 유지
-
-  # 실행
+  # SSF 생성/실행
+  $ssf = Build-SessionSsf $Plan
   $ssfPath = Join-Path $SPath "___session_$SName.ssf"
   Write-NoBom $ssfPath $ssf
   $CreatedSsf.Add($ssfPath)
 
   $sessionLog = Join-Path $SPath "siril_session.log"
-  $out = Invoke-Siril $SirilCli $ssfPath $sessionLog
+  $null = Invoke-Siril $SirilCli $ssfPath $sessionLog
 
-  # 프레임 수 추출 (로그 → Integration of N images)
-  $n = $null
-  $rx = [regex]'Integration of\s+(\d+)\s+images'
-  $matches = $rx.Matches($out)
-  if ($matches.Count -gt 0) { $n = [int]$matches[$matches.Count-1].Groups[1].Value }
-  if (-not $n) {
-    $n = (Get-ChildItem -Path $W_LIGHT -Filter 'r_pp_._*.fit' -File -ErrorAction SilentlyContinue |
-          Measure-Object | Select-Object -ExpandProperty Count)
-  }
-  $report.Add("$($SName): $n frames")
+  # 등록 결과 수집 (r_*)
+  $registered = @(
+    Get-ChildItem -Path $L.WorkDir -File -ErrorAction SilentlyContinue |
+      Where-Object { $_.Name -like "r_*" -and ($_.Extension -in ".fit",".fits",".fts") }
+  )
 
-  # 세션 스택 결과 복사
-  $sessStack = Join-Path $W_LIGHT "stack_session.fit"
-  if (Test-Path $sessStack) {
-    $dest = Join-Path $SessionStacks ("stack_{0}.fit" -f $SName)
-    Copy-Item $sessStack $dest -Force
+  if (-not $registered -or $registered.Count -eq 0) {
+    Write-Warning "세션 '$SName' → 등록 결과(r_*.fit)가 없습니다. siril_session.log 확인 필요"
+    $report.Add("$($SName): 0 registered frames")
+  } else {
+    foreach ($f in $registered) {
+      $dst = Join-Path $AllRegistered ("{0}_{1}" -f $SName, $f.Name)
+      Move-Item $f.FullName $dst -Force
+    }
+    $report.Add("$($SName): $($registered.Count) registered frames")
   }
+
+  # 세션별 _WORK 정리(원하면 유지 가능)
+  # Remove-Item $Plan.WorkRoot -Recurse -Force -ErrorAction SilentlyContinue
 }
 
-# === 최종 합성 ===
-$stackFiles = Get-ChildItem (Join-Path $SessionStacks "stack_*.fit") -ErrorAction SilentlyContinue
-if ($stackFiles.Count -eq 0) { throw "세션 스택을 하나도 만들지 못했습니다." }
+# 3) 최종 스택
+$allCount = (Get-ChildItem -Path $AllRegistered -File -ErrorAction SilentlyContinue |
+             Where-Object { $_.Extension -in ".fit",".fits",".fts" } | Measure-Object).Count
+if ($allCount -eq 0) { throw "_ALL_REGISTERED에 등록 프레임이 없습니다. 세션 처리/등록 단계 확인 필요." }
 
+Write-Host ("▶ 최종: 등록 프레임 {0}개 → 1회 스택" -f $allCount)
+
+# === 최종 스택(등록 프레임 전체 1회) ===
 $finalSsf = @"
 requires 1.2
-cd $(ToSirilPath $SessionStacks)
-convert .
-register ._
-stack r_._ rej 3 3 -norm=addscale -output_norm -rgb_equal -32b -weight=nbstack -out=stack_all
+cd $(ToSirilQ $AllRegistered)
 
-# === 후처리 ===
+# 등록 프레임 전체 스택
+convert all
+register all_
+stack r_all_ rej 3 3 -norm=addscale -output_norm -rgb_equal -32b -out=stack_all
+
+########################################
+# 일반 처리 (stretch + 배경제거 + asinh)
+########################################
 load stack_all
-
-# 원본 선형 스택 보존
-save $(ToSirilPath $StackPath)
-
-########### 일반처리
+save $(RelPath $AllRegistered $StackPath)
 
 # 1) Histogram Auto Stretch
 autostretch -linked
@@ -265,26 +585,29 @@ autostretch -linked
 # 2) Background Extraction
 subsky -rbf -samples=20 -smooth=0.5 -tolerance=2.0
 
-# 3) Asinh Transform (blackpoint 0.2)
+# 3) Asinh Transform
 asinh 1 0.2 -clipmode=globalrescale
 
-# 4) 결과 저장 (중간 FIT/JPG는 _WORK, 최종 FIT/JPG는 홈)
+# 4) 결과 저장
 save stack_all_processed
 savejpg stack_all_final 95
-save $(ToSirilPath (Join-Path $HomeDir "stack_all_processed"))
-savejpg $(ToSirilPath (Join-Path $HomeDir "stack_all_final")) 95
+save $(RelPath $AllRegistered (Join-Path $HomeDir "stack_all_processed"))
+savejpg $(RelPath $AllRegistered (Join-Path $HomeDir "stack_all_final")) 95
 
-########### HOO처리
-load $(ToSirilPath $StackPath)
+########################################
+# HOO 처리 (R=Ha, G/B=OIII)
+########################################
+# 스택 원본(선형)을 다시 로드
+load stack_all
 
-# 1) 채널 분리 -> _WORK에 R/G/B 파일 생성
+# 1) 채널 분리 (stack_R/G/B 생성)
 split stack_R stack_G stack_B
 
-# 2) OIII 합성 (G 크게, B 작게)
+# 2) OIII 합성: G 비중↑, B 비중↓
 pm '`$stack_G$ * 0.75 + `$stack_B$ * 0.25' -nosum
 save OIII_lin
 
-# 3) OIII 부스트 (필요에 따라 계수 2.0~3.0 조정)
+# 3) OIII 부스트 (2.0~3.0 범위에서 조절)
 pm '`$OIII_lin$ * 2.5' -nosum
 save OIII_boost
 
@@ -295,47 +618,46 @@ load composed_rgb
 # 5) 오토 스트레치
 autostretch -linked
 
-# 6) Background Extraction (다항식 근사)
+# 6) Background Extraction
 subsky -rbf -samples=20 -smooth=0.5 -tolerance=2.0
 
-# 7) Asinh 변환
+# 7) Asinh
 asinh 1 0.2 -clipmode=globalrescale
 
-# 8) JPEG로 저장 (_WORK 중간본 + 홈 최종본)
+# 8) 저장
 save stack_all_processed_HOO
 savejpg stack_all_final_HOO 95
-save $(ToSirilPath (Join-Path $HomeDir "stack_all_processed_HOO"))
-savejpg $(ToSirilPath (Join-Path $HomeDir "stack_all_final_HOO")) 95
+save $(RelPath $AllRegistered (Join-Path $HomeDir "stack_all_processed_HOO"))
+savejpg $(RelPath $AllRegistered (Join-Path $HomeDir "stack_all_final_HOO")) 95
 
 "@
 
-$finalPath = Join-Path $HomeDir "___final_weighted_stack.ssf"
+$finalPath = Join-Path $HomeDir "___final_stack.ssf"
 Write-NoBom $finalPath $finalSsf
 $CreatedSsf.Add($finalPath)
 
-Write-Host "▶ 최종 가중치 스택 실행..."
+Write-Host "▶ 최종 스택 실행..."
 $finalLog = Join-Path $HomeDir "final_siril.log"
-$finalOut = Invoke-Siril $SirilCli $finalPath $finalLog
+$null = Invoke-Siril $SirilCli $finalPath $finalLog
 Write-Host "  · 최종 스택 로그: $finalLog"
 
-# === 리포트 ===
-$report.Insert(0, ("총 세션 스택: {0}개" -f $stackFiles.Count))
+# 4) 리포트 저장
+$report.Insert(0, ("총 등록 프레임: {0}개" -f $allCount))
 $reportPath = Join-Path $HomeDir "session_stack_report.txt"
 [System.IO.File]::WriteAllLines($reportPath, $report)
 
-# === 정리: WORK + 중간산출물 삭제 ===
+# 5) 정리
 Write-Host "▶ 중간 산출물 정리..."
 # _WORK 폴더 삭제
-Get-ChildItem -Path (Join-Path $SessionRoot '*') -Directory -Recurse |
-  Where-Object { $_.Name -eq '_WORK' } |
-  Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+Get-ChildItem -Path $SessionRoot -Directory -ErrorAction SilentlyContinue |
+  ForEach-Object {
+    $workDir = Join-Path $_.FullName '_WORK'
+    if (Test-Path $workDir) {
+      Remove-Item $workDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+  }
 
-# 홈 아래 중간 산출물 삭제
-Get-ChildItem -Path (Join-Path $HomeDir '*') -File -Recurse -ErrorAction SilentlyContinue |
-  Where-Object { $_.Name -like 'r_all_*.fit' -or $_.Name -like '*.seq' -or $_.Name -like '._*.fit' -or $_.Name -like 'pp_._*.fit' -or $_.Name -like 'r_pp_._*.fit' } |
-  Remove-Item -Force
-
-# === 생성한 SSF 자동 삭제(옵션) ===
+# 생성한 SSF 자동 삭제
 if (-not $KeepSsf) {
   foreach ($p in $CreatedSsf) {
     if (Test-Path $p) { Remove-Item $p -Force -ErrorAction SilentlyContinue }
