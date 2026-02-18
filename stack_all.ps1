@@ -212,7 +212,12 @@ function Ensure-CommonMaster {
   if ((CountFrames $CommonDir) -le 0) { return $null }
 
   Write-Host "▶ 공통 $Kind 생성"
+  
+  $calLine = ""
+  $outName = if ($Kind -eq "bias") { "masterbias" } else { "masterdark" }
+  $stackLine = if ($Kind -eq "bias") { "stack bias_ med -out=$outName" } else { "stack dark_ med -nonorm -out=$outName" }
 
+<#
   $outName = if ($Kind -eq "bias") { "masterbias" } else { "masterdark" }
   $stackLine = if ($Kind -eq "bias") { "stack bias_ med -out=$outName" } else { "stack pp_dark_ med -nonorm -out=$outName" }
 
@@ -227,7 +232,7 @@ function Ensure-CommonMaster {
       $stackLine = "stack dark_ med -nonorm -out=$outName"
     }
   }
-
+#>
   $ssf = @"
 requires 1.2
 cd $(ToSirilQ $CommonDir)
@@ -369,8 +374,25 @@ stack bias_ med -out=$(RelPath $B.WorkDir $B.Master)
 "@
   }
 
-  # --- Dark master 생성 (필요시) : bias가 있으면 제거 후 stack ---
+# --- Dark master 생성 (필요시) : bias가 있으면 제거 후 stack --- bias는 제거하지 않음
+  <# Gemini답변.
+  우리가 찍는 Dark 프레임 안에는 이미 Bias(전기적 노이즈) 성분이 포함되어 있기 때문입니다.
+  Dark = (열 노이즈) + (Bias 노이즈)
+  Light = (별빛) + (열 노이즈) + (Bias 노이즈)
+  따라서 Light에서 Dark를 그냥 빼버리면, 열 노이즈와 Bias가 한꺼번에 세트로 제거됩니다.
+  $$Light - Dark = (별빛 + \text{열} + \text{Bias}) - (\text{열} + \text{Bias}) = \text{별빛}
+  $$여기서 Dark를 만들기 전에 Bias를 미리 빼버린다면, 나중에 Light에서 뺄 때 Bias 성분이 남게 되어 별도로 또 Bias를 빼줘야 하는 번거로움이 생깁니다.
+  #>
   if ($D.Create) {
+    $ssf += @"
+cd $(ToSirilQ $D.WorkDir)
+convert dark
+
+stack dark_ med -nonorm -out=$(RelPath $D.WorkDir $D.Master)
+
+"@
+	  
+<#
     $darkBiasArg = ""
     if ($B.Master) { $darkBiasArg = " -bias=" + (RelPath $D.WorkDir $B.Master) }
 
@@ -392,10 +414,24 @@ stack dark_ med -nonorm -out=$(RelPath $D.WorkDir $D.Master)
 
 "@
     }
+#>
   }
 
   # --- DarkFlat master 생성 (필요시) : bias가 있으면 제거 후 stack ---
+  <# Gemini답변
+  결론부터 말씀드리면, Darkflat을 만들 때도 Bias를 따로 뺄 필요가 없습니다.
+  그 이유는 앞서 설명해 드린 Master Dark의 원리와 완전히 동일하기 때문입니다. Darkflat 자체가 이미 **'특정 노출 시간 동안 발생한 열 잡음 + Bias'**를 모두 머금고 있는 상태입니다.
+  #>
   if ($DF.Create) {
+    $ssf += @"
+cd $(ToSirilQ $DF.WorkDir)
+convert darkflat
+
+stack darkflat_ med -nonorm -out=$(RelPath $DF.WorkDir $DF.Master)
+
+"@
+
+<#
     $dfBiasArg = ""
     if ($B.Master) { $dfBiasArg = " -bias=" + (RelPath $DF.WorkDir $B.Master) }
 
@@ -417,18 +453,33 @@ stack darkflat_ med -nonorm -out=$(RelPath $DF.WorkDir $DF.Master)
 
 "@
     }
+#>
   }
 
   # --- Flat master 생성 (필요시) ---
+  <#
+  Flat보정할 때 Light용 Dark를 써도 돼? 노출시간은 달라.
+  Gemini said
+  결론부터 말씀드리면, 절대 안 됩니다.
+  천체사진 보정에서 가장 중요한 대원칙은 **"노출 시간(Exposure Time)이 다르면 Dark는 서로 호환되지 않는다"**는 것입니다. 
+  #>
   if ($F.Create) {
-    # Flat 보정 우선순위: 세션 DarkFlat > 세션 Dark > 공통 Dark
+    # Flat 보정 우선순위: 세션 DarkFlat > 세션 Dark > 공통 Dark --> 폐기
+    # Flat 보정 우선순위: 세션 DarkFlat > 공통 Bias
+	<#
     $FlatDarkArg = ""
     if ($DF.Master) { $FlatDarkArg = " -dark=" + (RelPath $F.WorkDir $DF.Master) }
     elseif ($D.Master) { $FlatDarkArg = " -dark=" + (RelPath $F.WorkDir $D.Master) }
 
     $FlatBiasArg = ""
     if ($B.Master) { $FlatBiasArg = " -bias=" + (RelPath $F.WorkDir $B.Master) }
+	#>
 
+    $FlatDarkArg = ""
+    $FlatBiasArg = ""
+    if ($DF.Master) { $FlatDarkArg = " -dark=" + (RelPath $F.WorkDir $DF.Master) } # DarkFlat을 사용하거나,
+    elseif ($B.Master) { $FlatBiasArg = " -bias=" + (RelPath $F.WorkDir $B.Master) } # Bias를 사용한다
+	
     $ssf += @"
 cd $(ToSirilQ $F.WorkDir)
 convert flat
@@ -439,9 +490,11 @@ stack cbflat_flat_ med -norm=mul -out=$(RelPath $F.WorkDir $F.Master)
   }
 
   # --- Light calibrate + register ---
-  # Light 보정 우선순위: 세션 Dark > 공통 Dark > 없음
+  # Light 보정 우선순위: 세션 Dark > 공통 Dark > 공통 Bias
   $calDark = ""
+  $calBias = ""
   if ($D.Master) { $calDark = " -dark=" + (RelPath $L.WorkDir $D.Master) }
+  elseif ($B.Master) { $calBias = " -bias=" + (RelPath $F.WorkDir $B.Master) } # Bias를 사용한다
 
   $calFlat = ""
   if ($F.Master) { $calFlat = " -flat=" + (RelPath $L.WorkDir $F.Master) }
@@ -449,7 +502,7 @@ stack cbflat_flat_ med -norm=mul -out=$(RelPath $F.WorkDir $F.Master)
   $ssf += @"
 cd $(ToSirilQ $L.WorkDir)
 convert light
-calibrate light_$calDark$calFlat -cc=dark -cfa -equalize_cfa -debayer -prefix=pp_
+calibrate light_$calDark$calBias$calFlat -cc=dark -cfa -equalize_cfa -debayer -prefix=pp_
 
 # 별 적은 필드(B33) 등록 완화
 #setfindstar -relax=on
