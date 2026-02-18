@@ -657,6 +657,11 @@ Get-ChildItem -Path $SessionRoot -Directory -ErrorAction SilentlyContinue |
     }
   }
 
+# 홈 아래 중간 산출물 삭제
+Get-ChildItem -Path (Join-Path $HomeDir '*') -File -Recurse -ErrorAction SilentlyContinue |
+  Where-Object { $_.Name -like '*.ssf' -or $_.Name -like '*.seq' } |
+  Remove-Item -Force
+
 # 생성한 SSF 자동 삭제
 if (-not $KeepSsf) {
   foreach ($p in $CreatedSsf) {
